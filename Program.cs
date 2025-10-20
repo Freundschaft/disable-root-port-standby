@@ -9,6 +9,24 @@ public static class Native
   // --- Power/lid GUIDs ---
   public static readonly Guid GUID_LIDSWITCH_STATE_CHANGE = new Guid("BA3E0F4D-B817-4094-A2D1-D56379E6A0F3");
 
+  // --- Session notification (lock/unlock) ---
+  public const int SERVICE_CONTROL_SESSIONCHANGE = 0x0000000E;
+  public const int WTS_SESSION_UNLOCK = 0x8;
+  public const int NOTIFY_FOR_THIS_SESSION = 0;
+
+  [DllImport("Wtsapi32.dll", SetLastError = true)]
+  public static extern bool WTSRegisterSessionNotification(IntPtr hWnd, int dwFlags);
+
+  [DllImport("Wtsapi32.dll", SetLastError = true)]
+  public static extern bool WTSUnRegisterSessionNotification(IntPtr hWnd);
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct WTSSESSION_NOTIFICATION
+  {
+    public int cbSize;
+    public int dwSessionId;
+  }
+
   // --- Register for power setting notifications ---
   [DllImport("User32.dll", SetLastError = true)]
   public static extern IntPtr RegisterPowerSettingNotification(
@@ -61,6 +79,8 @@ public class LidService : ServiceBase
 
   private IntPtr _svcHandle = IntPtr.Zero;
   private IntPtr _lidReg = IntPtr.Zero;
+  private bool _sessionRegistered = false;
+  private bool _ignoreFirstLidNotification = true;
 
   // race guard: 0=idle, 1=disabling, 2=disabled, 3=enabling
   private static int _phase = 0;
@@ -70,6 +90,7 @@ public class LidService : ServiceBase
     ServiceName = "Gpp6Cutover";
     CanStop = true; CanShutdown = true;
     CanHandlePowerEvent = true; // not relied on, but fine
+    CanHandleSessionChangeEvent = true;
     AutoLog = false;
   }
 
@@ -84,17 +105,51 @@ protected override void OnStart(string[] args)
   _lidReg = Native.RegisterPowerSettingNotification(_svcHandle, ref lidGuid, 1 /*DEVICE_NOTIFY_SERVICE_HANDLE*/);
   if (_lidReg == IntPtr.Zero) Log("RegisterPowerSettingNotification failed: " + Marshal.GetLastWin32Error());
   else Log("Registered GUID_LIDSWITCH_STATE_CHANGE.");
+
+  // Register for session notifications (lock/unlock)
+  _sessionRegistered = Native.WTSRegisterSessionNotification(_svcHandle, Native.NOTIFY_FOR_THIS_SESSION);
+  if (!_sessionRegistered) Log("WTSRegisterSessionNotification failed: " + Marshal.GetLastWin32Error());
+  else Log("Registered for session change notifications.");
 }
 
   protected override void OnStop()
   {
     try { if (_lidReg != IntPtr.Zero) Native.UnregisterPowerSettingNotification(_lidReg); } catch {}
+    try { if (_sessionRegistered) Native.WTSUnRegisterSessionNotification(_svcHandle); } catch {}
     Log("Service stopped.");
   }
 
   // Service control callback with full power data
   private int HandlerEx(int control, int eventType, IntPtr eventData, IntPtr context)
   {
+    const int SERVICE_CONTROL_STOP = 1;
+    const int SERVICE_CONTROL_SHUTDOWN = 5;
+    const int SERVICE_STOPPED = 1;
+    const int SERVICE_ACCEPT_STOP = 1;
+    const int SERVICE_WIN32_OWN_PROCESS = 0x10;
+
+    if (control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN)
+    {
+      Log($"Service control: {(control == SERVICE_CONTROL_STOP ? "STOP" : "SHUTDOWN")}");
+
+      // Update service status to STOPPED
+      var status = new Native.SERVICE_STATUS
+      {
+        dwServiceType = SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState = SERVICE_STOPPED,
+        dwControlsAccepted = 0,
+        dwWin32ExitCode = 0,
+        dwServiceSpecificExitCode = 0,
+        dwCheckPoint = 0,
+        dwWaitHint = 0
+      };
+      Native.SetServiceStatus(_svcHandle, ref status);
+
+      // Call base class handler to ensure cleanup
+      base.OnStop();
+      return 0;
+    }
+
     if (control == Native.SERVICE_CONTROL_POWEREVENT && eventType == Native.PBT_POWERSETTINGCHANGE)
     {
       try
@@ -105,12 +160,35 @@ protected override void OnStart(string[] args)
         {
           // Data is a BYTE: 0=closed, 1=open
           byte state = Marshal.ReadByte(eventData, Marshal.OffsetOf<Native.POWERBROADCAST_SETTING>("Data").ToInt32());
+
+          // Ignore first notification (current state on registration)
+          if (_ignoreFirstLidNotification)
+          {
+            Log($"LID: Initial state notification (state={state}) - ignoring");
+            _ignoreFirstLidNotification = false;
+            return 0;
+          }
+
           if (state == 0) { Log("LID: CLOSED → pre-sleep disable"); TryDisableOnce(); }
           else            { Log("LID: OPEN   → resume enable");     TryEnableOnce();  }
         }
       }
       catch (Exception ex) { Log("HandlerEx error: " + ex); }
     }
+
+    if (control == Native.SERVICE_CONTROL_SESSIONCHANGE)
+    {
+      try
+      {
+        if (eventType == Native.WTS_SESSION_UNLOCK)
+        {
+          Log("SESSION: UNLOCK → enable");
+          TryEnableOnce();
+        }
+      }
+      catch (Exception ex) { Log("HandlerEx session error: " + ex); }
+    }
+
     return 0;
   }
 
