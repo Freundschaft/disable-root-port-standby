@@ -97,6 +97,7 @@ public class LidService : ServiceBase
 protected override void OnStart(string[] args)
 {
   Log("Service started.");
+  EnsureEnabledOnStartup();
 
   _svcHandle = Native.RegisterServiceCtrlHandlerEx(this.ServiceName, HandlerEx, IntPtr.Zero);
   if (_svcHandle == IntPtr.Zero) Log("RegisterServiceCtrlHandlerEx failed: " + Marshal.GetLastWin32Error());
@@ -214,6 +215,21 @@ protected override void OnStart(string[] args)
     Log("Enable: acquired");
     try { Thread.Sleep(800); Run("pnputil.exe", $"/enable-device \"{Root}\""); Interlocked.Exchange(ref _phase, 0); Log("Enable: done"); return true; }
     catch (Exception ex){ Log("Enable ERROR: " + ex); Interlocked.Exchange(ref _phase, 0); return false; }
+  }
+
+  private static void EnsureEnabledOnStartup()
+  {
+    ThreadPool.QueueUserWorkItem(_ =>
+    {
+      try
+      {
+        Log("Startup: enabling root port to clear prior disabled state");
+        Run("pnputil.exe", $"/enable-device \"{Root}\"");
+        Interlocked.Exchange(ref _phase, 0);
+        Log("Startup: enable attempted");
+      }
+      catch (Exception ex) { Log("Startup enable error: " + ex); }
+    });
   }
 
   public static void Main(){ ServiceBase.Run(new LidService()); }
