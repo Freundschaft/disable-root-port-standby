@@ -69,6 +69,7 @@ public class LidService : ServiceBase
 
   // race guard: 0=idle, 1=disabling, 2=disabled, 3=enabling
   private static int _phase = 0;
+  private static int _enableRecoveryWorker = 0;
   private IntPtr _svcHandle = IntPtr.Zero;
   private IntPtr _lidReg = IntPtr.Zero;
   private bool _ignoreFirstLidNotification = true;
@@ -309,24 +310,81 @@ public class LidService : ServiceBase
   private static bool TryEnableAfterResume()
   {
     int previous = AcquireEnablePhase();
-    if (previous < 0) return false;
+    if (previous == -1) return false;
+    if (previous == -2)
+    {
+      ScheduleEnableRecovery("disable still in progress", 1500);
+      return false;
+    }
 
     Log($"Enable: acquired (prev={previous})");
 
-    try
+    for (int attempt = 1; attempt <= 6; attempt++)
     {
-      Thread.Sleep(800);
-      Run("pnputil.exe", $"/enable-device \"{Root}\"");
-      Interlocked.Exchange(ref _phase, 0);
-      Log("Enable: done");
-      return true;
+      try
+      {
+        Thread.Sleep(attempt == 1 ? 800 : 1200);
+        Run("pnputil.exe", $"/enable-device \"{Root}\"");
+        Interlocked.Exchange(ref _phase, 0);
+        Log($"Enable: done (attempt {attempt})");
+        return true;
+      }
+      catch (Exception ex)
+      {
+        Log($"Enable attempt {attempt} ERROR: {ex.Message}");
+      }
     }
-    catch (Exception ex)
+
+    Log("Enable ERROR: exhausted retries");
+    Interlocked.Exchange(ref _phase, previous == 2 ? 2 : 0);
+    if (previous == 2) ScheduleEnableRecovery("retries exhausted", 2500);
+    return false;
+  }
+
+  private static void ScheduleEnableRecovery(string reason, int initialDelayMs)
+  {
+    if (Interlocked.CompareExchange(ref _enableRecoveryWorker, 1, 0) != 0)
     {
-      Log("Enable ERROR: " + ex);
-      Interlocked.Exchange(ref _phase, 0);
-      return false;
+      Log($"Enable recovery already scheduled ({reason})");
+      return;
     }
+
+    ThreadPool.QueueUserWorkItem(_ =>
+    {
+      try
+      {
+        Log($"Enable recovery scheduled ({reason}), delay={initialDelayMs}ms");
+        Thread.Sleep(initialDelayMs);
+
+        for (int pass = 1; pass <= 8; pass++)
+        {
+          int phase = Volatile.Read(ref _phase);
+          if (phase == 0)
+          {
+            Log("Enable recovery: phase idle, exiting");
+            return;
+          }
+
+          if (TryEnableAfterResume())
+          {
+            Log($"Enable recovery: success on pass {pass}");
+            return;
+          }
+
+          Thread.Sleep(3000);
+        }
+
+        Log("Enable recovery: exhausted");
+      }
+      catch (Exception ex)
+      {
+        Log("Enable recovery error: " + ex);
+      }
+      finally
+      {
+        Interlocked.Exchange(ref _enableRecoveryWorker, 0);
+      }
+    });
   }
 
   private static int AcquireEnablePhase()
@@ -335,14 +393,14 @@ public class LidService : ServiceBase
     while (true)
     {
       int current = Volatile.Read(ref _phase);
-      if (current == 3) return -1;
+      if (current == 3) return -1; // already enabling
 
       if (current == 1)
       {
         if (sw.ElapsedMilliseconds > 6000)
         {
           Log("Enable skipped: disable still in progress");
-          return -1;
+          return -2;
         }
 
         Thread.Sleep(50);
