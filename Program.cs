@@ -1,8 +1,10 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using System.Threading;
+using System.Xml;
 
 public static class Native
 {
@@ -52,10 +54,22 @@ public static class Native
 
 public class LidService : ServiceBase
 {
+  private enum RootPortState
+  {
+    Unknown,
+    Missing,
+    Started,
+    Disabled,
+    Other
+  }
+
   // Your PCIe Root Port (double backslashes)
   private static readonly string Root = @"PCI\VEN_1022&DEV_14EE&SUBSYS_50EE17AA&REV_00\3&2411E6FE&0&12";
 
   private static readonly string LogFile = @"C:\Scripts\gpp6-cutover-service.log";
+  private const int QueryTimeoutMs = 5000;
+  private const int DisableTimeoutMs = 8000;
+  private const int EnableTimeoutMs = 10000;
 
   private static void Log(string m)
   {
@@ -70,9 +84,15 @@ public class LidService : ServiceBase
   // race guard: 0=idle, 1=disabling, 2=disabled, 3=enabling
   private static int _phase = 0;
   private static int _enableRecoveryWorker = 0;
+  private static long _disabledSinceUtcTicks = 0;
+  private static long _lastEnableAttemptUtcTicks = 0;
+  private static readonly TimeSpan FailsafePeriod = TimeSpan.FromSeconds(30);
+  private static readonly TimeSpan FailsafeDisabledThreshold = TimeSpan.FromSeconds(20);
+  private static readonly TimeSpan FailsafeMinAttemptGap = TimeSpan.FromSeconds(10);
   private IntPtr _svcHandle = IntPtr.Zero;
   private IntPtr _lidReg = IntPtr.Zero;
   private bool _ignoreFirstLidNotification = true;
+  private Timer _failsafeTimer;
   private readonly Native.ServiceControlHandlerEx _handlerEx;
 
   public LidService()
@@ -90,6 +110,7 @@ public class LidService : ServiceBase
   {
     Log("Service started.");
     EnsureEnabledOnStartup();
+    StartFailsafeMonitor();
 
     _svcHandle = Native.RegisterServiceCtrlHandlerEx(this.ServiceName, _handlerEx, IntPtr.Zero);
     if (_svcHandle == IntPtr.Zero)
@@ -118,6 +139,14 @@ public class LidService : ServiceBase
     try
     {
       if (_lidReg != IntPtr.Zero) Native.UnregisterPowerSettingNotification(_lidReg);
+    }
+    catch { }
+
+    try
+    {
+      _failsafeTimer?.Dispose();
+      _failsafeTimer = null;
+      Log("Failsafe monitor stopped.");
     }
     catch { }
 
@@ -187,6 +216,7 @@ public class LidService : ServiceBase
           break;
 
         case PowerBroadcastStatus.ResumeAutomatic:
+        case PowerBroadcastStatus.ResumeCritical:
         case PowerBroadcastStatus.ResumeSuspend:
           Log($"POWER: {powerStatus} -> enable");
           TryEnableAfterResume();
@@ -247,7 +277,7 @@ public class LidService : ServiceBase
     base.OnCustomCommand(command);
   }
 
-  private static void Run(string exe, string args)
+  private static int Run(string exe, string args, int timeoutMs = 5000)
   {
     using (var p = new Process())
     {
@@ -259,7 +289,7 @@ public class LidService : ServiceBase
       };
 
       p.Start();
-      bool exited = p.WaitForExit(5000);
+      bool exited = p.WaitForExit(timeoutMs);
       if (!exited)
       {
         try
@@ -270,7 +300,7 @@ public class LidService : ServiceBase
         catch { }
 
         Log($"{exe} {args} -> timeout");
-        throw new System.TimeoutException($"{exe} timed out after 5000ms");
+        throw new System.TimeoutException($"{exe} timed out after {timeoutMs}ms");
       }
 
       Log($"{exe} {args} -> exit {p.ExitCode}");
@@ -278,6 +308,8 @@ public class LidService : ServiceBase
       {
         throw new InvalidOperationException($"{exe} exited with code {p.ExitCode}");
       }
+
+      return p.ExitCode;
     }
   }
 
@@ -290,7 +322,16 @@ public class LidService : ServiceBase
 
     try
     {
-      Run("pnputil.exe", $"/disable-device \"{Root}\"");
+      if (!EnsureRootPortState(false, "Disable", 2, 0, 500, DisableTimeoutMs))
+      {
+        Log("Disable ERROR: root port did not reach Disabled state");
+        Interlocked.Exchange(ref _disabledSinceUtcTicks, 0);
+        Interlocked.Exchange(ref _phase, 0);
+        return false;
+      }
+
+      Interlocked.Exchange(ref _disabledSinceUtcTicks, DateTime.UtcNow.Ticks);
+      Interlocked.Exchange(ref _lastEnableAttemptUtcTicks, 0);
       Interlocked.Exchange(ref _phase, 2);
       Log("Disable: done");
       return true;
@@ -298,6 +339,7 @@ public class LidService : ServiceBase
     catch (Exception ex)
     {
       Log("Disable ERROR: " + ex);
+      Interlocked.Exchange(ref _disabledSinceUtcTicks, 0);
       Interlocked.Exchange(ref _phase, 0);
       return false;
     }
@@ -321,18 +363,17 @@ public class LidService : ServiceBase
 
     for (int attempt = 1; attempt <= 6; attempt++)
     {
-      try
+      int delayMs = attempt == 1 ? 800 : 1200;
+      Interlocked.Exchange(ref _lastEnableAttemptUtcTicks, DateTime.UtcNow.Ticks);
+      if (!EnsureRootPortState(true, "Enable", 1, delayMs, 0, EnableTimeoutMs))
       {
-        Thread.Sleep(attempt == 1 ? 800 : 1200);
-        Run("pnputil.exe", $"/enable-device \"{Root}\"");
-        Interlocked.Exchange(ref _phase, 0);
-        Log($"Enable: done (attempt {attempt})");
-        return true;
+        continue;
       }
-      catch (Exception ex)
-      {
-        Log($"Enable attempt {attempt} ERROR: {ex.Message}");
-      }
+
+      Interlocked.Exchange(ref _disabledSinceUtcTicks, 0);
+      Interlocked.Exchange(ref _phase, 0);
+      Log($"Enable: done (attempt {attempt})");
+      return true;
     }
 
     Log("Enable ERROR: exhausted retries");
@@ -418,7 +459,13 @@ public class LidService : ServiceBase
       try
       {
         Log("Startup: enabling root port to clear prior disabled state");
-        Run("pnputil.exe", $"/enable-device \"{Root}\"");
+        if (!EnsureRootPortState(true, "Startup", 2, 0, 1000, EnableTimeoutMs))
+        {
+          Log("Startup enable error: root port did not reach Started state");
+          return;
+        }
+
+        Interlocked.Exchange(ref _disabledSinceUtcTicks, 0);
         Interlocked.Exchange(ref _phase, 0);
         Log("Startup: enable attempted");
       }
@@ -427,6 +474,125 @@ public class LidService : ServiceBase
         Log("Startup enable error: " + ex);
       }
     });
+  }
+
+  private void StartFailsafeMonitor()
+  {
+    _failsafeTimer = new Timer(_ => FailsafeTick(), null, FailsafePeriod, FailsafePeriod);
+    Log($"Failsafe monitor started (period={FailsafePeriod.TotalSeconds:0}s)");
+  }
+
+  private static void FailsafeTick()
+  {
+    try
+    {
+      if (Volatile.Read(ref _phase) != 2) return;
+
+      long nowTicks = DateTime.UtcNow.Ticks;
+      long disabledSinceTicks = Interlocked.Read(ref _disabledSinceUtcTicks);
+      long lastEnableAttemptTicks = Interlocked.Read(ref _lastEnableAttemptUtcTicks);
+
+      if (disabledSinceTicks == 0)
+      {
+        Interlocked.Exchange(ref _disabledSinceUtcTicks, nowTicks);
+        return;
+      }
+
+      TimeSpan disabledFor = new TimeSpan(nowTicks - disabledSinceTicks);
+      TimeSpan sinceLastAttempt = lastEnableAttemptTicks == 0
+        ? TimeSpan.MaxValue
+        : new TimeSpan(nowTicks - lastEnableAttemptTicks);
+
+      if (disabledFor < FailsafeDisabledThreshold) return;
+      if (sinceLastAttempt < FailsafeMinAttemptGap) return;
+
+      Log($"Failsafe: disabled for {disabledFor.TotalSeconds:0}s; scheduling enable recovery");
+      ScheduleEnableRecovery("failsafe monitor", 0);
+    }
+    catch (Exception ex)
+    {
+      Log("Failsafe tick error: " + ex);
+    }
+  }
+
+  private static bool EnsureRootPortState(bool wantEnabled, string operation, int attempts, int firstDelayMs, int retryDelayMs, int timeoutMs)
+  {
+    RootPortState initialState = QueryRootPortState();
+    if (IsDesiredState(initialState, wantEnabled))
+    {
+      Log($"{operation}: already {(wantEnabled ? "enabled" : "disabled")} (state={initialState})");
+      return true;
+    }
+
+    string command = wantEnabled ? "/enable-device" : "/disable-device";
+    for (int attempt = 1; attempt <= attempts; attempt++)
+    {
+      int delayMs = attempt == 1 ? firstDelayMs : retryDelayMs;
+      if (delayMs > 0) Thread.Sleep(delayMs);
+
+      try
+      {
+        Run("pnputil.exe", $"{command} \"{Root}\"", timeoutMs);
+      }
+      catch (Exception ex)
+      {
+        Log($"{operation} attempt {attempt} command error: {ex.Message}");
+      }
+
+      RootPortState state = QueryRootPortState();
+      Log($"{operation} attempt {attempt}: state={state}");
+      if (IsDesiredState(state, wantEnabled)) return true;
+    }
+
+    return false;
+  }
+
+  private static bool IsDesiredState(RootPortState state, bool wantEnabled)
+  {
+    return wantEnabled ? state == RootPortState.Started : state == RootPortState.Disabled;
+  }
+
+  private static RootPortState QueryRootPortState()
+  {
+    string tempFile = Path.GetTempFileName();
+    try
+    {
+      Run("pnputil.exe", $"/enum-devices /instanceid \"{Root}\" /format xml /output-file \"{tempFile}\"", QueryTimeoutMs);
+      return ParseRootPortState(tempFile);
+    }
+    catch (Exception ex)
+    {
+      Log("State query error: " + ex.Message);
+      return RootPortState.Unknown;
+    }
+    finally
+    {
+      try { File.Delete(tempFile); } catch { }
+    }
+  }
+
+  private static RootPortState ParseRootPortState(string xmlPath)
+  {
+    var doc = new XmlDocument();
+    doc.Load(xmlPath);
+
+    XmlNode statusNode = doc.SelectSingleNode("/PnpUtil/Device/Status");
+    if (statusNode == null)
+    {
+      return doc.SelectSingleNode("/PnpUtil/Device") == null
+        ? RootPortState.Missing
+        : RootPortState.Unknown;
+    }
+
+    switch ((statusNode.InnerText ?? string.Empty).Trim())
+    {
+      case "Started":
+        return RootPortState.Started;
+      case "Disabled":
+        return RootPortState.Disabled;
+      default:
+        return RootPortState.Other;
+    }
   }
 
   public static void Main()
