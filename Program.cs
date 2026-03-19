@@ -11,9 +11,15 @@ public static class Native
   public static readonly Guid GUID_LIDSWITCH_STATE_CHANGE = new Guid("BA3E0F4D-B817-4094-A2D1-D56379E6A0F3");
 
   public const int SERVICE_CONTROL_POWEREVENT = 0x0000000D;
+  public const int SERVICE_CONTROL_SESSIONCHANGE = 0x0000000E;
   public const int PBT_POWERSETTINGCHANGE = 0x8013;
+  public const int PBT_APMSUSPEND = 0x0004;
+  public const int PBT_APMRESUMECRITICAL = 0x0006;
+  public const int PBT_APMRESUMESUSPEND = 0x0007;
+  public const int PBT_APMRESUMEAUTOMATIC = 0x0012;
   public const int SERVICE_CONTROL_STOP = 0x00000001;
   public const int SERVICE_CONTROL_SHUTDOWN = 0x00000005;
+  public const int WTS_SESSION_UNLOCK = 0x00000008;
 
   [DllImport("User32.dll", SetLastError = true)]
   public static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid PowerSettingGuid, uint Flags);
@@ -54,6 +60,13 @@ public static class Native
 
 public class LidService : ServiceBase
 {
+  private enum LidState
+  {
+    Unknown = -1,
+    Closed = 0,
+    Open = 1
+  }
+
   private enum RootPortState
   {
     Unknown,
@@ -83,12 +96,16 @@ public class LidService : ServiceBase
 
   // race guard: 0=idle, 1=disabling, 2=disabled, 3=enabling
   private static int _phase = 0;
+  private static int _lidState = (int)LidState.Unknown;
   private static int _enableRecoveryWorker = 0;
   private static long _disabledSinceUtcTicks = 0;
   private static long _lastEnableAttemptUtcTicks = 0;
+  private static long _lastStrongWakeSignalUtcTicks = 0;
   private static readonly TimeSpan FailsafePeriod = TimeSpan.FromSeconds(30);
   private static readonly TimeSpan FailsafeDisabledThreshold = TimeSpan.FromSeconds(20);
   private static readonly TimeSpan FailsafeMinAttemptGap = TimeSpan.FromSeconds(10);
+  private static readonly TimeSpan EnableSettleDelay = TimeSpan.FromSeconds(8);
+  private static readonly TimeSpan StrongWakeGracePeriod = TimeSpan.FromMinutes(2);
   private IntPtr _svcHandle = IntPtr.Zero;
   private IntPtr _lidReg = IntPtr.Zero;
   private bool _ignoreFirstLidNotification = true;
@@ -166,33 +183,75 @@ public class LidService : ServiceBase
       return 0;
     }
 
-    if (control == Native.SERVICE_CONTROL_POWEREVENT && eventType == Native.PBT_POWERSETTINGCHANGE)
+    if (control == 128)
+    {
+      Log("CUSTOM: 128 -> disable");
+      TryDisableOnce();
+      return 0;
+    }
+
+    if (control == 129)
+    {
+      Log("CUSTOM: 129 -> enable");
+      TryEnableAfterResume();
+      return 0;
+    }
+
+    if (control == Native.SERVICE_CONTROL_SESSIONCHANGE && eventType == Native.WTS_SESSION_UNLOCK)
+    {
+      HandleEnableSignal("SESSION: UNLOCK", true);
+      return 0;
+    }
+
+    if (control == Native.SERVICE_CONTROL_POWEREVENT)
     {
       try
       {
-        var setting = Marshal.PtrToStructure<Native.POWERBROADCAST_SETTING>(eventData);
-        if (setting.PowerSetting == Native.GUID_LIDSWITCH_STATE_CHANGE)
+        if (eventType == Native.PBT_POWERSETTINGCHANGE)
         {
-          int dataOffset = Marshal.OffsetOf<Native.POWERBROADCAST_SETTING>("Data").ToInt32();
-          byte state = Marshal.ReadByte(eventData, dataOffset);
-
-          if (_ignoreFirstLidNotification)
+          var setting = Marshal.PtrToStructure<Native.POWERBROADCAST_SETTING>(eventData);
+          if (setting.PowerSetting == Native.GUID_LIDSWITCH_STATE_CHANGE)
           {
-            Log($"LID: Initial state notification (state={state}) - ignoring");
-            _ignoreFirstLidNotification = false;
+            int dataOffset = Marshal.OffsetOf<Native.POWERBROADCAST_SETTING>("Data").ToInt32();
+            byte state = Marshal.ReadByte(eventData, dataOffset);
+            Interlocked.Exchange(ref _lidState, state == 0 ? (int)LidState.Closed : (int)LidState.Open);
+
+            if (_ignoreFirstLidNotification)
+            {
+              Log($"LID: Initial state notification (state={state}) - ignoring");
+              _ignoreFirstLidNotification = false;
+              return 0;
+            }
+
+            if (state == 0)
+            {
+              Log("LID: CLOSED -> pre-sleep disable");
+              TryDisableOnce();
+            }
+            else
+            {
+              HandleEnableSignal("LID: OPEN", true);
+            }
+
             return 0;
           }
+        }
 
-          if (state == 0)
-          {
-            Log("LID: CLOSED -> pre-sleep disable");
+        switch (eventType)
+        {
+          case Native.PBT_APMSUSPEND:
+            Log("POWER: SUSPEND -> disable");
             TryDisableOnce();
-          }
-          else
-          {
-            Log("LID: OPEN -> enable");
-            TryEnableAfterResume();
-          }
+            break;
+
+          case Native.PBT_APMRESUMEAUTOMATIC:
+            HandleEnableSignal("POWER: ResumeAutomatic", false);
+            break;
+
+          case Native.PBT_APMRESUMECRITICAL:
+          case Native.PBT_APMRESUMESUSPEND:
+            HandleEnableSignal("POWER: Resume", true);
+            break;
         }
       }
       catch (Exception ex)
@@ -216,10 +275,12 @@ public class LidService : ServiceBase
           break;
 
         case PowerBroadcastStatus.ResumeAutomatic:
+          HandleEnableSignal($"POWER: {powerStatus}", false);
+          break;
+
         case PowerBroadcastStatus.ResumeCritical:
         case PowerBroadcastStatus.ResumeSuspend:
-          Log($"POWER: {powerStatus} -> enable");
-          TryEnableAfterResume();
+          HandleEnableSignal($"POWER: {powerStatus}", true);
           break;
       }
     }
@@ -237,8 +298,7 @@ public class LidService : ServiceBase
     {
       if (changeDescription.Reason == SessionChangeReason.SessionUnlock)
       {
-        Log("SESSION: UNLOCK -> enable");
-        TryEnableAfterResume();
+        HandleEnableSignal("SESSION: UNLOCK", true);
       }
     }
     catch (Exception ex)
@@ -332,6 +392,7 @@ public class LidService : ServiceBase
 
       Interlocked.Exchange(ref _disabledSinceUtcTicks, DateTime.UtcNow.Ticks);
       Interlocked.Exchange(ref _lastEnableAttemptUtcTicks, 0);
+      Interlocked.Exchange(ref _lastStrongWakeSignalUtcTicks, 0);
       Interlocked.Exchange(ref _phase, 2);
       Log("Disable: done");
       return true;
@@ -371,6 +432,7 @@ public class LidService : ServiceBase
       }
 
       Interlocked.Exchange(ref _disabledSinceUtcTicks, 0);
+      Interlocked.Exchange(ref _lastStrongWakeSignalUtcTicks, 0);
       Interlocked.Exchange(ref _phase, 0);
       Log($"Enable: done (attempt {attempt})");
       return true;
@@ -399,6 +461,12 @@ public class LidService : ServiceBase
 
         for (int pass = 1; pass <= 8; pass++)
         {
+          if (ShouldBlockRecoveryBecauseLidClosed())
+          {
+            Log("Enable recovery: lid still closed, exiting");
+            return;
+          }
+
           int phase = Volatile.Read(ref _phase);
           if (phase == 0)
           {
@@ -466,6 +534,7 @@ public class LidService : ServiceBase
         }
 
         Interlocked.Exchange(ref _disabledSinceUtcTicks, 0);
+        Interlocked.Exchange(ref _lastStrongWakeSignalUtcTicks, 0);
         Interlocked.Exchange(ref _phase, 0);
         Log("Startup: enable attempted");
       }
@@ -487,6 +556,7 @@ public class LidService : ServiceBase
     try
     {
       if (Volatile.Read(ref _phase) != 2) return;
+      if (ShouldBlockRecoveryBecauseLidClosed()) return;
 
       long nowTicks = DateTime.UtcNow.Ticks;
       long disabledSinceTicks = Interlocked.Read(ref _disabledSinceUtcTicks);
@@ -513,6 +583,84 @@ public class LidService : ServiceBase
     {
       Log("Failsafe tick error: " + ex);
     }
+  }
+
+  private static bool IsLidClosed()
+  {
+    return Volatile.Read(ref _lidState) == (int)LidState.Closed;
+  }
+
+  private static void HandleEnableSignal(string source, bool strongSignal)
+  {
+    if (strongSignal)
+    {
+      Interlocked.Exchange(ref _lastStrongWakeSignalUtcTicks, DateTime.UtcNow.Ticks);
+    }
+
+    if (ShouldSkipBackgroundEnable(source, strongSignal)) return;
+
+    int settleDelayMs = GetEnableSettleDelayMs();
+    if (settleDelayMs > 0)
+    {
+      Log($"{source} -> waiting {settleDelayMs}ms before enable");
+      ScheduleEnableRecovery(source + " settle delay", settleDelayMs);
+      return;
+    }
+
+    if (!strongSignal)
+    {
+      Log($"{source} -> weak wake signal, scheduling retry");
+      ScheduleEnableRecovery(source + " weak wake signal", 2500);
+      return;
+    }
+
+    Log($"{source} -> enable");
+    TryEnableAfterResume();
+  }
+
+  private static int GetEnableSettleDelayMs()
+  {
+    long disabledSinceTicks = Interlocked.Read(ref _disabledSinceUtcTicks);
+    if (disabledSinceTicks == 0) return 0;
+
+    long nowTicks = DateTime.UtcNow.Ticks;
+    TimeSpan disabledFor = new TimeSpan(nowTicks - disabledSinceTicks);
+    if (disabledFor >= EnableSettleDelay) return 0;
+
+    return (int)Math.Ceiling((EnableSettleDelay - disabledFor).TotalMilliseconds);
+  }
+
+  private static bool ShouldSkipBackgroundEnable(string source)
+  {
+    return ShouldSkipBackgroundEnable(source, false);
+  }
+
+  private static bool ShouldSkipBackgroundEnable(string source, bool strongSignal)
+  {
+    if (!IsLidClosed()) return false;
+
+    if (strongSignal)
+    {
+      Log($"{source} -> lid state still closed, but strong wake signal present");
+      return false;
+    }
+
+    Log($"{source} -> lid still closed, skipping enable");
+    return true;
+  }
+
+  private static bool ShouldBlockRecoveryBecauseLidClosed()
+  {
+    return IsLidClosed() && !HasRecentStrongWakeSignal();
+  }
+
+  private static bool HasRecentStrongWakeSignal()
+  {
+    long lastStrongWakeSignalTicks = Interlocked.Read(ref _lastStrongWakeSignalUtcTicks);
+    if (lastStrongWakeSignalTicks == 0) return false;
+
+    long nowTicks = DateTime.UtcNow.Ticks;
+    return new TimeSpan(nowTicks - lastStrongWakeSignalTicks) <= StrongWakeGracePeriod;
   }
 
   private static bool EnsureRootPortState(bool wantEnabled, string operation, int attempts, int firstDelayMs, int retryDelayMs, int timeoutMs)
